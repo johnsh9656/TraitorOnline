@@ -14,6 +14,7 @@ using Unity.Services.Authentication;
 public class GameplayManager : NetworkBehaviour
 {
     const int MIN_PLAYERS = 2;
+    const float PHASE_LENGTH = 30f;
 
     [SerializeField] GameObject descriptionUI;
     [SerializeField] GameObject votingUI;
@@ -34,17 +35,17 @@ public class GameplayManager : NetworkBehaviour
     [SerializeField] TextMeshProUGUI votingText;
     [SerializeField] TextMeshProUGUI skipVoteText;
     [SerializeField] TextMeshProUGUI dayText;
+    [SerializeField] TextMeshProUGUI phaseText;
 
     private NetworkVariable<bool> gameStarted = new NetworkVariable<bool>(false, NetworkVariableReadPermission.Everyone);
     private NetworkVariable<int> readyPlayers = new NetworkVariable<int>(0, NetworkVariableReadPermission.Everyone);
     
-    // -1 game not started ; 0 assigning roles ; 1 day; 2 night
-    private NetworkVariable<int> phase = new NetworkVariable<int>(-1, NetworkVariableReadPermission.Everyone);
+    private NetworkVariable<int> phase = new NetworkVariable<int>(2, NetworkVariableReadPermission.Everyone);
 
     private NetworkVariable<int> day = new NetworkVariable<int>(1, NetworkVariableReadPermission.Everyone);
     private NetworkVariable<int> playerCount = new NetworkVariable<int>(1, NetworkVariableReadPermission.Everyone);
     private NetworkVariable<int> skipVote = new NetworkVariable<int>(0, NetworkVariableReadPermission.Everyone);
-    private NetworkVariable<ulong> killTargetID = new NetworkVariable<ulong>();
+    private NetworkVariable<ulong> killTargetID = new NetworkVariable<ulong>(100);
     private NetworkVariable<FixedString128Bytes> tempPlayerName = new NetworkVariable<FixedString128Bytes>("", NetworkVariableReadPermission.Everyone);
     
     private List<Player> innocents = new List<Player>();
@@ -54,6 +55,10 @@ public class GameplayManager : NetworkBehaviour
     private int voteTarget = -1;
     private int innocentsLeftToWin = 0; // temp -- should be 2 //
     private ulong traitorId = 0;
+
+    private DayNightCycle dayNightCycle;
+    private Timer timer;
+    private bool gameOver = false;
 
     private void Awake()
     {
@@ -73,7 +78,7 @@ public class GameplayManager : NetworkBehaviour
 
         readyButton.onClick.AddListener(() =>
         {
-            ReadyButtonPressed();
+            //ReadyButtonPressed();
         });   
         
         confirmKillButton.onClick.AddListener(() =>
@@ -97,6 +102,7 @@ public class GameplayManager : NetworkBehaviour
         day.OnValueChanged += DayValueChanged;
         skipVote.OnValueChanged += SkipVoteValueChanged;
         playerCount.OnValueChanged += PlayerCountValueChanged;
+        phase.OnValueChanged += PhaseValueChanged;
         NetworkManager.Singleton.OnClientDisconnectCallback += OnClientDisconnect;
         
         if (IsServer) { hostStartButton.gameObject.SetActive(true); Debug.Log("HOST"); }
@@ -106,6 +112,8 @@ public class GameplayManager : NetworkBehaviour
 
     private void OnClientDisconnect(ulong disconnectId)
     {
+        if (gameOver) return;
+
         if (disconnectId==traitorId) { InnocentsWinClientRpc(); return; }
 
         Debug.Log("removed " + allPlayers[(int)disconnectId].GetPlayerName());
@@ -133,6 +141,23 @@ public class GameplayManager : NetworkBehaviour
         playerCountText.text = "Players: " + newValue;
     }
 
+    private void PhaseValueChanged(int oldValue, int newValue)
+    {
+        string phase = "";
+        if (newValue == 0)
+        {
+            phase = "Night";
+        } else if (newValue == 1)
+        {
+            phase = "Vote";
+        } else if (newValue == 2)
+        {
+            phase = "Day";
+        }
+        phaseText.text = phase;
+        Debug.Log("Phase changed to " + phase);
+    }
+
     private void Update()
     {
         playersReadyText.text = "Players ready: " + readyPlayers.Value.ToString();
@@ -144,8 +169,10 @@ public class GameplayManager : NetworkBehaviour
     [ClientRpc]
     private void HostLeaveClientRpc()
     {
-        FindObjectOfType<HostDisconnectUI>().Show(); // may be redundant
         LeaveLobbyButtonPressedServerRpc(AuthenticationService.Instance.PlayerId);
+        if (gameOver) return;
+
+        FindObjectOfType<HostDisconnectUI>().Show(); // may be redundant
     }
 
     private void HostStartButtonPressed()
@@ -158,17 +185,16 @@ public class GameplayManager : NetworkBehaviour
         GameLobby.Instance.DeleteLobby();
 
         gameStarted.Value = true;
-        phase.Value = 0;
         AssignRolesPhaseServerRpc();
     }
-    
+
     [ServerRpc(RequireOwnership = false)]
     private void LeaveLobbyButtonPressedServerRpc(string id)
     {
         GameLobby.Instance.KickPlayer(id);
     }
 
-    private void ReadyButtonPressed()
+    /*private void ReadyButtonPressed()
     {
         readyButton.enabled = false;
 
@@ -185,21 +211,48 @@ public class GameplayManager : NetworkBehaviour
 
             if (readyPlayers.Value == GetInnocentsLeft()+1)
             {
+                timer.ResetTimerClientRpc();
                 readyPlayers.Value = 0;
                 readyButton.gameObject.SetActive(false);
 
-                // determine day or night depending on phase value
-                if (phase.Value == 0)
+                if (phase.Value == 0) // from night to voting
                 {
                     phase.Value = 1;
-                    DayPhaseClientRpc();
+                    VotePhaseClientRpc();
                 }
-                else if (phase.Value == 1)
+                else if (phase.Value == 1) // from voting to day
                 {
                     phase.Value = 2;
+                    DayPhaseClientRpc();
+                }
+                else if (phase.Value == 2) // from day to night
+                {
+                    phase.Value = 0;
                     NightPhaseClientRpc();
                 }
             }
+        }
+    }*/
+
+    public void TimerEnded()
+    {
+        Debug.Log("Timer ended!\nPhase: " + phase.Value);
+        readyPlayers.Value = 0;
+
+        if (phase.Value == 1)
+        {
+            phase.Value = 2;
+            TimeEndVoteClientRpc();
+        }
+        else if (phase.Value == 2)
+        {
+            phase.Value = 0;
+            StartCoroutine(WaitToTransitionDayNight());
+        }
+        else if (phase.Value == 0)
+        {
+            phase.Value = 1;
+            TimeEndNightPhaseClientRpc();
         }
     }
 
@@ -230,11 +283,14 @@ public class GameplayManager : NetworkBehaviour
         readyButton.gameObject.SetActive(false);
         roleText.gameObject.SetActive(true);
 
-        // assign playeres to allPlayers
+        // assign players to allPlayers
         foreach (Player p in FindObjectsOfType<Player>())
         {
             allPlayers.Add(p);
             if (!p.IsDead() && p.NetworkObject.OwnerClientId != traitorId) innocents.Add(p);
+
+            // not optimal but works temporarily
+            p.skinManager.Hide();
         }
         Debug.Log("innocents count: " + innocents.Count);
 
@@ -252,73 +308,62 @@ public class GameplayManager : NetworkBehaviour
         Debug.Log("local client id: " + NetworkManager.LocalClientId);
         Debug.Log("traitor id: " + traitorId.ToString());
 
+        timer = FindObjectOfType<Timer>();
+        timer.SetGameplayManager(this);
+        dayNightCycle = FindObjectOfType<DayNightCycle>();
+
         // add wait time, animation
-        InitializeReadyButtonClientRpc();
+        if (IsServer) StartCoroutine(WaitToStartGame());
+    }
+
+    private IEnumerator WaitToStartGame()
+    {
+        yield return new WaitForSecondsRealtime(4f);
+        DayPhaseClientRpc();
     }
 
     [ClientRpc]
-    private void DayPhaseClientRpc()
+    private void VotePhaseDescriptionClientRpc()
     {
-        // clear ui
         Debug.Log("day: " + day.Value);
-        readyButton.gameObject.SetActive(false);
-        roleText.gameObject.SetActive(false);
-        littleRoleText.gameObject.SetActive(true);
-        dayText.gameObject.SetActive(true);
-
-        // day 1 -- no voting, no shopping
-        if (day.Value == 1)
-        {
-            InitializeReadyButtonClientRpc();
-            return;
-        }
 
         // description
         descriptionUI.SetActive(true);
-        if ((int)killTargetID.Value != -1)
+        if ((int)killTargetID.Value != 100)
         {
             descriptionText.text = "In the middle of the night... " + tempPlayerName.Value.ToString() + " was killed.";
         }
         else
         {
-            descriptionText.text = "In the middle of hte night... nothing happened.";
+            descriptionText.text = "It was a calm night.";
         }
 
         if (IsServer)
         {
+            phase.Value = 1;
             StartCoroutine(WaitToVote());
         }
 
-        if (localPlayer.IsDead())
+        /*if (localPlayer.IsDead())
         {
             return;
-        }
-
-        // set visuals to day
-
-        // description - if day one build world
-
-        // voting
-
-        // work, shop, or other activities
-
-        // timer
-        // int list for votes for each client + skip option
-        // if person voted out - check for end game
-        // else move to night phase
-
-        //InitializeReadyButtonClientRpc();
+        }*/
     }
 
     private IEnumerator WaitToVote()
     {
-        yield return new WaitForSecondsRealtime(10f);
+        yield return new WaitForSecondsRealtime(4f);
         VotingPhaseClientRpc();
     }
 
     [ClientRpc]
     private void VotingPhaseClientRpc()
     {
+        Debug.Log("MADE IT TO VOTING RPC");
+        // set visuals and timer for voting
+        dayNightCycle.SetState(2, PHASE_LENGTH, false);
+        timer.SetTimeRemaining(PHASE_LENGTH);
+
         descriptionUI.SetActive(false);
         votingUI.SetActive(true);
         voteTarget = -1; // represents "skip vote"
@@ -399,6 +444,8 @@ public class GameplayManager : NetworkBehaviour
 
     private void ConfirmVoteButtonPressed()
     {
+        Debug.Log("pressed confirm vote button");
+
         confirmVoteButton.enabled = false;
         foreach (Player p in allPlayers)
         {
@@ -416,6 +463,7 @@ public class GameplayManager : NetworkBehaviour
         if (readyPlayers.Value >= GetInnocentsLeft()+1) // end voting
         {
             readyPlayers.Value = 0;
+            //QuickTransitionToDayClientRpc();
 
             // determine outcome
             int mostVotes = skipVote.Value;
@@ -453,10 +501,75 @@ public class GameplayManager : NetworkBehaviour
     }
 
     [ClientRpc]
+    private void QuickTransitionToDayClientRpc()
+    {
+        dayNightCycle.SetState(0, 2f, true);
+        timer.ResetTimer();
+    }
+
+    [ClientRpc]
+    private void TimeEndVoteClientRpc() // for when timer runs out instead of all players confirming vote
+    {
+        readyButton.gameObject.SetActive(false);
+        playersReadyText.gameObject.SetActive(false);
+
+        // clean up ui
+        confirmVoteButton.enabled = false;
+        skipVoteButton.enabled = false;
+        foreach (Player p in allPlayers)
+        {
+            p.DisableVoteButton();
+        }
+        
+        if (IsHost)
+        {
+            TimeEndVoteHostSide();
+        }
+    }
+
+    private void TimeEndVoteHostSide()
+    {
+        readyPlayers.Value = 0;
+
+        // determine outcome
+        int mostVotes = skipVote.Value;
+        List<Player> votedIds = new List<Player>();
+        foreach (Player p in allPlayers)
+        {
+            if (p.IsDead()) continue;
+
+            if (p.GetVotes() > mostVotes)
+            {
+                mostVotes = p.GetVotes();
+                votedIds.Clear();
+                votedIds.Add(p);
+            }
+            else if (p.GetVotes() == mostVotes)
+            {
+                votedIds.Add(p);
+            }
+        }
+
+        if (mostVotes >= MajorityValue() && votedIds.Count == 1) // someone dies
+        {
+            votedIds[0].KillClientRpc();
+
+            string names = votedIds[0].GetPlayerName() + " was ";
+            string description = names + "was killed for treason.";
+            EndVotingPhaseClientRpc(description);
+
+        }
+        else // no one dies
+        {
+            string description = "No one was voted out.";
+            EndVotingPhaseClientRpc(description);
+        }
+    }
+
+    [ClientRpc]
     private void EndVotingPhaseClientRpc(string description)
     {
-        ////// add delay //////
-
+        Debug.Log("Ending Voting Phase!");
 
         // disable voting ui
         votingUI.SetActive(false);
@@ -464,7 +577,10 @@ public class GameplayManager : NetworkBehaviour
         {
             p.SetVoteUI(false);
             p.ClearAllVotesServerRpc();
+            p.EnableVoteButton();
         }
+        confirmVoteButton.enabled = true;
+        skipVoteButton.enabled = true;
 
         // description
         descriptionUI.SetActive(true);
@@ -478,11 +594,34 @@ public class GameplayManager : NetworkBehaviour
 
     private IEnumerator WaitAfterVotingDescription()
     {
-        yield return new WaitForSecondsRealtime(5f);
-        ContinueAfterVoteServerRpc();
+        yield return new WaitForSecondsRealtime(4f);
+
+        Player traitor_p = NetworkManager.Singleton.ConnectedClients[traitorId].PlayerObject.GetComponent<Player>();
+
+        if (traitor_p.IsDead()) // innocents win
+        {
+            InnocentsWinClientRpc();
+        }
+        else if (GetInnocentsLeft() > innocentsLeftToWin) // continue to day
+        {
+            HandleVisualsVoteToDayClientRpc();
+            yield return new WaitForSecondsRealtime(2f);
+            DayPhaseClientRpc();
+        }
+        else // traitor wins
+        {
+            TraitorWinsClientRpc();
+        }
     }
 
-    [ServerRpc(RequireOwnership = false)]
+    [ClientRpc]
+    private void HandleVisualsVoteToDayClientRpc()
+    {
+        dayNightCycle.SetState(2, 2f, true);
+        timer.ResetTimer();
+    }
+
+    /*[ServerRpc(RequireOwnership = false)]
     private void ContinueAfterVoteServerRpc()
     {
         Player traitor_p = NetworkManager.Singleton.ConnectedClients[traitorId].PlayerObject.GetComponent<Player>();
@@ -499,19 +638,67 @@ public class GameplayManager : NetworkBehaviour
         {
             TraitorWinsClientRpc();
         }
+    }*/
+
+    [ClientRpc]
+    private void DayPhaseClientRpc()
+    {
+        Debug.Log("ITS DAY TIME");
+        // set visuals to day
+        dayNightCycle.SetState(0, PHASE_LENGTH, false);
+        timer.SetTimeRemaining(PHASE_LENGTH);
+        descriptionUI.SetActive(false);
+
+        // day one - description to build world, start day/night cycle
+        if (day.Value == 1)
+        {
+            playersReadyText.gameObject.SetActive(false);
+            readyButton.gameObject.SetActive(false);
+            roleText.gameObject.SetActive(false);
+
+            littleRoleText.gameObject.SetActive(true);
+            dayText.gameObject.SetActive(true);
+            return;
+        }
+
+        if (IsServer) phase.Value = 2;
+
+        // work, shop, or other activities
+
+        //InitializeReadyButtonClientRpc();
+    }
+
+    private IEnumerator WaitToTransitionDayNight()
+    {
+        readyButton.gameObject.SetActive(false);
+        playersReadyText.gameObject.SetActive(false);
+        yield return new WaitForSecondsRealtime(2f);
+        NightPhaseClientRpc();
+        //EndDayPhaseClientRpc();
+    }
+
+    [ClientRpc]
+    private void EndDayPhaseClientRpc()
+    {
+        Debug.Log("day ending from timer");
+        NightPhaseClientRpc();
     }
 
     [ClientRpc]
     private void NightPhaseClientRpc()
     {
+        // set visuals to night
+        dayNightCycle.SetState(1, PHASE_LENGTH, false);
+        timer.SetTimeRemaining(PHASE_LENGTH);
+        if (IsServer) phase.Value = 0;
+
         if (localPlayer.IsDead())
         {
             return;
         }
 
-        Debug.Log("night");
-        readyButton.gameObject.SetActive(false);
-        // set visuals to night
+        Debug.Log("ITS NIGHT");
+        
 
         // activate kill ui of each player
         if (NetworkManager.LocalClientId == traitorId)
@@ -584,7 +771,7 @@ public class GameplayManager : NetworkBehaviour
         {
             // continue to next day
             day.Value++;
-            phase.Value = 1;
+            HandleVisualsNightToDayClientRpc();
             StartCoroutine(WaitBeforeNextDay());
         } else
         {
@@ -593,12 +780,45 @@ public class GameplayManager : NetworkBehaviour
         }
     }
 
+    [ClientRpc]
+    private void HandleVisualsNightToDayClientRpc()
+    {
+        dayNightCycle.SetState(1, 2f, true);
+        timer.ResetTimer();
+    }
+
+    [ClientRpc]
+    private void TimeEndNightPhaseClientRpc()
+    {
+        readyButton.gameObject.SetActive(false);
+        playersReadyText.gameObject.SetActive(false);
+
+        // disable ui for traitor
+        if (NetworkManager.LocalClientId == traitorId)
+        {
+            confirmKillButton.gameObject.SetActive(false);
+
+            foreach (Player p in innocents)
+            {
+                p.selectedKillUI.SetActive(false);
+                p.SetKillUI(false);
+            }
+        }
+
+        if (IsHost)
+        {
+            killTargetID.Value = 100;
+            day.Value++;
+            StartCoroutine(WaitBeforeNextDay());
+        }
+    }
+
     // the purpose of this is to allow for the networkvariables to change their value
     // on all clients before their new values are used in the next day
     private IEnumerator WaitBeforeNextDay()
     {
         yield return new WaitForSeconds(4);
-        DayPhaseClientRpc();
+        VotePhaseDescriptionClientRpc();
     }
 
     public int GetInnocentsLeft()
@@ -617,27 +837,40 @@ public class GameplayManager : NetworkBehaviour
     [ClientRpc]
     private void TraitorWinsClientRpc()
     {
+        gameOver = true;
         Destroy(FindObjectOfType<HostDisconnectUI>());
+        Destroy(timer);
+        Destroy(dayNightCycle);
         descriptionUI.SetActive(false);
 
         EndUI eui = Instantiate(endUI).GetComponentInChildren<EndUI>();
         eui.Set("The Traitor Wins", allPlayers[(int)traitorId].GetPlayerName());
 
-        NetworkManager.Singleton.Shutdown();
         Destroy(FindObjectOfType<HostDisconnectUI>());
+
+        if (IsServer) StartCoroutine(WaitDisconnectHost());
     }
 
     [ClientRpc]
     private void InnocentsWinClientRpc()
     {
+        gameOver = true;
         Destroy(FindObjectOfType<HostDisconnectUI>());
+        Destroy(timer);
+        Destroy(dayNightCycle);
         descriptionUI.SetActive(false);
 
         EndUI eui = Instantiate(endUI).GetComponentInChildren<EndUI>();
         eui.Set("The Innocents Win", allPlayers[(int)traitorId].GetPlayerName());
 
-        NetworkManager.Singleton.Shutdown();
         Destroy(FindObjectOfType<HostDisconnectUI>());
+        if (IsServer) StartCoroutine(WaitDisconnectHost());
+    }
+
+    private IEnumerator WaitDisconnectHost()
+    {
+        yield return new WaitForSecondsRealtime(2f);
+        NetworkManager.Singleton.Shutdown();
     }
 
     public void AssignLocalPlayer(Player p)
@@ -650,5 +883,10 @@ public class GameplayManager : NetworkBehaviour
         int count = GetInnocentsLeft() + 1;
         if (count % 2 == 0) return count / 2;
         else return (int) (count / 2) + 1;
+    }
+
+    public bool GameStarted()
+    {
+        return gameStarted.Value;
     }
 }

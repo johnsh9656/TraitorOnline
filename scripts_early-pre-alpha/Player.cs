@@ -27,8 +27,6 @@ public class Player : NetworkBehaviour
     [SerializeField] private Button killButton;
     [SerializeField] private Button voteButton;
 
-    [SerializeField] private Material tempDeadMat;
-
     private bool isDead = false;
     public bool assigned = false;
     public bool isTraitor = false;
@@ -36,22 +34,28 @@ public class Player : NetworkBehaviour
 
     private NetworkVariable<int> votes = new NetworkVariable<int>(0, NetworkVariableReadPermission.Everyone);
     private NetworkVariable<FixedString128Bytes> networkPlayerName =
-        new NetworkVariable<FixedString128Bytes>("Player: 0", NetworkVariableReadPermission.Everyone,
-            NetworkVariableWritePermission.Server);
-
+        new NetworkVariable<FixedString128Bytes>("null", NetworkVariableReadPermission.Everyone,
+            NetworkVariableWritePermission.Owner);
+    private LocalTextChat textChat;
+    public SkinManager skinManager;
+    private PlayerAnimHandler animHandler;
 
     public override void OnNetworkSpawn()
     {
-        // set name - TEMPORARY
-        // update to match player's name in SupremeManager
-        networkPlayerName.Value = "Player: " + (OwnerClientId + 1);
-        playerName.text = networkPlayerName.Value.ToString();
+        textChat = GetComponentInChildren<LocalTextChat>();
+        skinManager = GetComponentInChildren<SkinManager>();
+        animHandler = GetComponent<PlayerAnimHandler>();
+        networkPlayerName.OnValueChanged += NameValueChanged;
 
         if (OwnerClientId == NetworkManager.LocalClientId)
         {
+            //SetPlayerNameServerRpc(SupremeManager.Instance.GetPlayerName());
+            networkPlayerName.Value = SupremeManager.Instance.GetPlayerName();
             Instantiate(hostDisconnectUI);
+            animHandler.enabled = true;
+            animHandler.SetAsLocalPlayer();
             playerUICanvas.SetActive(true);
-            playerNameTextUI.text = networkPlayerName.Value.ToString();
+            textChat.SetAsOwned();
         }
 
         if (IsHost && IsOwner) // instantiate gameplay manager
@@ -71,6 +75,15 @@ public class Player : NetworkBehaviour
 
         voteText.text = "0";
         votes.OnValueChanged += VoteValueChanged;
+
+        playerName.text = networkPlayerName.Value.ToString();
+        playerNameTextUI.text = networkPlayerName.Value.ToString();
+    }
+
+    private void NameValueChanged(FixedString128Bytes oldValue, FixedString128Bytes newValue)
+    {
+        playerName.text = networkPlayerName.Value.ToString();
+        playerNameTextUI.text = networkPlayerName.Value.ToString();
     }
 
     private void VoteValueChanged(int oldValue, int newValue)
@@ -82,8 +95,9 @@ public class Player : NetworkBehaviour
     private void GameSceneStart()
     {
         loadedGameScene = true;
-        Vector3 spawnPoint = FindObjectOfType<SpawnPoint>().transform.position + new Vector3(1.5f * OwnerClientId, 0, 0);
-        transform.position = spawnPoint;
+        Transform spawnPoint = FindObjectOfType<SpawnPoint>().GetSpawnpoint((int)OwnerClientId);
+        transform.position = spawnPoint.position;
+        transform.rotation = spawnPoint.rotation;
     }
 
     private void Update()
@@ -114,6 +128,11 @@ public class Player : NetworkBehaviour
     public void DisableVoteButton()
     {
         voteButton.enabled = false;
+    }
+
+    public void EnableVoteButton()
+    {
+        voteButton.enabled = true;
     }
 
     private void VoteButtonPressed()
@@ -150,13 +169,13 @@ public class Player : NetworkBehaviour
 
         if (NetworkManager.LocalClientId == OwnerClientId) {
             localDeadUI.SetActive(true);
+            textChat.enabled = false;
         }
 
         isDead = true;
 
         // kill anim
         Debug.Log(GetPlayerName() + " just died");
-        GetComponent<MeshRenderer>().material = tempDeadMat;
 
     }
 
@@ -174,7 +193,7 @@ public class Player : NetworkBehaviour
         votes.Value--;
     }
 
-    [ServerRpc]
+    [ServerRpc(RequireOwnership = false)]
     public void ClearAllVotesServerRpc()
     {
         votes.Value = 0;
@@ -188,5 +207,10 @@ public class Player : NetworkBehaviour
     public int GetVotes()
     {
         return votes.Value;
+    }
+
+    public void ResetEmoteIndex()
+    {
+        animHandler.ResetEmoteIndexEvent();
     }
 }
